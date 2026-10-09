@@ -1,0 +1,15 @@
+b60-dual-fixes
+Copyright 2026 LocalXPU
+
+shim/ is original work, licensed under Apache-2.0 (see LICENSE).
+
+patches/xpu-communicator-bucketed-allreduce.patch modifies
+vllm/distributed/device_communicators/xpu_communicator.py from vLLM
+(SPDX-License-Identifier: Apache-2.0, Copyright contributors to the vLLM
+project, https://github.com/vllm-project/vllm). The patch is a derivative of that
+file and stays under Apache-2.0. The patch contains only our added lines plus
+context lines from the vLLM file; no other vLLM or llm-scaler code is included.
+
+intel/llm-scaler (https://github.com/intel/llm-scaler, Apache-2.0) is where the
+Docker image the patch was tested against comes from. Nothing from it is
+redistributed here.

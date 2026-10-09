@@ -1,0 +1,97 @@
+--- a/vllm/distributed/device_communicators/xpu_communicator.py	2026-10-08 20:18:10.934747061 -0500
++++ b/vllm/distributed/device_communicators/xpu_communicator.py	2026-10-08 20:18:10.938747054 -0500
+@@ -16,6 +16,50 @@
+ _SKIP_ALL_REDUCE = os.environ.get("SKIP_ALL_REDUCE") == "1"
+ _INPLACE_ALL_REDUCE = os.environ.get("VLLM_XPU_INPLACE_ALLREDUCE", "1") == "1"
+ 
++# LocalXPU patch: bound the number of distinct all-reduce message sizes.
++# oneCCL's host-staged path (CCL_TOPO_P2P_ACCESS=0) caches one host staging buffer per EXACT message size in
++# ccl::regular_buffer_cache and never evicts (src/sched/buffer/buffer_cache.cpp). Every new prefill-chunk length
++# therefore leaked a buffer of up to ~84 MB: +1.15 GB per worker for 12 varied prompts, flat with
++# CCL_BUFFER_CACHE=0 (which halves decode speed). Padding each eager all-reduce to a bounded bucket set keeps
++# the cache (and its speed) but caps it. Zero padding cannot change the reduced values: the result copied back
++# is bit-identical. Off unless VLLM_XPU_AR_PAD=1.
++_AR_PAD = os.environ.get("VLLM_XPU_AR_PAD") == "1"
++# Messages at or below _AR_PAD_MIN elements are not padded: decode batches are already padded to the XPU-graph
++# capture sizes (<= 40 tokens), so small sizes form a small bounded set, and padding them cost ~20% decode speed
++# (three extra kernels on each of ~128 all-reduces per step, measured 2026-09-29).
++_AR_PAD_MIN = int(os.environ.get("VLLM_XPU_AR_PAD_MIN", str(64 * 5120)))
++_AR_PAD_GRAN = int(os.environ.get("VLLM_XPU_AR_PAD_GRAN", str(1 << 21)))  # elements (4 MB fp16); power of two so the two regimes meet cleanly
++
++
++# Diagnostics (off unless VLLM_XPU_COLL_TRACE=1): log the Python stack of every torch.distributed
++# collective whose message is > 4 MB and not a bucket size, to find collectives that bypass the padding.
++if os.environ.get("VLLM_XPU_COLL_TRACE") == "1":
++    import functools, traceback
++    def _trace(fn, name):
++        @functools.wraps(fn)
++        def w(*a, **k):
++            try:
++                ts = [x for x in list(a) + list(k.values()) if isinstance(x, torch.Tensor)]
++                ts += [y for x in a if isinstance(x, (list, tuple)) for y in x if isinstance(y, torch.Tensor)]
++                nb = max((t.numel() * t.element_size() for t in ts), default=0)
++                if nb > (1 << 22) and nb % (1 << 22):
++                    logger.warning("COLLTRACE %s bytes=%d shapes=%s\n%s", name, nb, [tuple(t.shape) for t in ts],
++                                   "".join(traceback.format_stack(limit=14)[:-1]))
++            except Exception:
++                pass
++            return fn(*a, **k)
++        return w
++    for _n in ("all_reduce", "all_gather", "all_gather_into_tensor", "reduce_scatter", "reduce_scatter_tensor",
++               "broadcast", "all_to_all_single"):
++        if hasattr(dist, _n):
++            setattr(dist, _n, _trace(getattr(dist, _n), _n))
++
++
++def _ar_bucket(numel: int) -> int:
++    if numel <= _AR_PAD_GRAN:
++        return 1 << (numel - 1).bit_length()          # next power of two
++    return -(-numel // _AR_PAD_GRAN) * _AR_PAD_GRAN  # next multiple of the granule
++
+ 
+ class XpuCommunicator(DeviceCommunicatorBase):
+     def __init__(
+@@ -68,11 +112,43 @@
+             dist.all_reduce(output, group=self.device_group)
+         else:
+             assert self.device_group is not None
++            numel = output.numel()
++            bucket = _ar_bucket(numel) if _AR_PAD and numel > _AR_PAD_MIN else numel
++            if bucket != numel:
++                padded = torch.zeros(bucket, dtype=output.dtype, device=output.device)
++                padded[:numel].copy_(output.reshape(-1))
++                work = self.device_group.allreduce([padded], self._allreduce_options)
++                if work is not None:
++                    work.wait()
++                output.copy_(padded[:numel].view(output.shape))
++                return output
+             work = self.device_group.allreduce([output], self._allreduce_options)
+             if work is not None:
+                 work.wait()
+         return output
+ 
++    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        # The model graph calls vllm::all_gather on [T, hidden/tp] once per forward (traced 2026-09-29,
++        # torch.ops.vllm.all_gather(buf, -1, 2, 'tp:0')). Its oneCCL message size follows T, so pad T (dim 0) to a
++        # bucketed row count like all_reduce, gather, and slice the rows back. Rows are independent, so the kept
++        # rows are bit-identical. Other dims and non-padded mode fall through to the base implementation.
++        if not _AR_PAD or input_.dim() < 2 or input_.shape[0] == 0 or torch.compiler.is_compiling():
++            return super().all_gather(input_, dim)
++        rows = input_.shape[0]
++        row_elems = input_[0].numel()
++        if rows * row_elems <= _AR_PAD_MIN:
++            return super().all_gather(input_, dim)
++        target = -(-_ar_bucket(rows * row_elems) // row_elems)
++        if target == rows:
++            return super().all_gather(input_, dim)
++        padded = torch.zeros((target,) + tuple(input_.shape[1:]), dtype=input_.dtype, device=input_.device)
++        padded[:rows].copy_(input_)
++        out = super().all_gather(padded, dim)
++        if dim % input_.dim() == 0:
++            # gathered along the row dim: [world*target, ...] -> keep each rank's first `rows` rows
++            return torch.cat([c[:rows] for c in out.chunk(self.world_size, dim=0)], dim=0)
++        return out[:rows]
++
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+         world_size = self.world_size
+ 
